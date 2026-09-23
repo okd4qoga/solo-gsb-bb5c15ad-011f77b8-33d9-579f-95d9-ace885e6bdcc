@@ -126,7 +126,7 @@ body {
 
 #rule-editor { border-top: 1px dashed var(--border); margin-top: 10px; padding-top: 8px; }
 .field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
-.field input, .field select, .cond-row input, .cond-row select, #brush-label, #brush-note {
+.field input, .field select, .cond-row input, .cond-row select, #brush-label, #brush-note, #brush-device, #brush-type {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 5px 7px;
@@ -159,6 +159,12 @@ body {
 .anno-rect { fill: var(--anno); opacity: 0.28; }
 .anno-edge { stroke: #b45309; stroke-width: 1.4; }
 .anno-label-text { font-size: 10px; fill: #92400e; }
+.maint-rect { fill: url(#hatch-maint); opacity: 0.85; }
+.maint-edge { stroke: #0f766e; stroke-width: 1.4; }
+.maint-band-label { font-size: 10px; fill: #0f766e; }
+.maint-label-text { font-size: 9.5px; fill: #115e59; pointer-events: none; }
+.maint-lane-rect { fill: #99f6e4; opacity: 0.22; pointer-events: all; }
+.supp-rect { pointer-events: all; }
 .crosshair { stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
 .crosshair-label { font-size: 10px; fill: #334155; }
 .brush-rect { fill: rgba(37, 99, 235, 0.15); stroke: var(--primary); stroke-dasharray: 4 3; }
@@ -244,6 +250,27 @@ body {
 .anno-row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-bottom: 1px dashed var(--border); font-size: 13px; flex-wrap: wrap; }
 .anno-row:last-child { border-bottom: none; }
 .anno-chip { width: 12px; height: 12px; border-radius: 3px; background: var(--anno); }
+
+.maint-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.maint-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border: 1px solid #99f6e4; border-radius: 8px; background: #f0fdfa;
+  font-size: 12px; flex-wrap: wrap;
+}
+.maint-row strong { font-weight: 600; color: #115e59; }
+.maint-row .fault-time { font-size: 11px; }
+.maint-chip { font-size: 12px; }
+#maint-editor { border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px; }
+.legend-hatch {
+  background-image: repeating-linear-gradient(45deg, #0d9488 0 1.5px, transparent 1.5px 4px);
+  border: 1px solid #0d9488;
+}
+.legend-hatch-red {
+  width: 10px; height: 10px; border-radius: 2px; display: inline-block;
+  background-color: #fee2e2;
+  background-image: repeating-linear-gradient(45deg, #991b1b 0 1.2px, transparent 1.2px 3.5px);
+  border: 1px solid #991b1b;
+}
 
 .events-wrap { max-height: 340px; overflow: auto; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }

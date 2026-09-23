@@ -11,10 +11,12 @@ from .engine import (
     Condition,
     Event,
     Interval,
+    MaintenanceWindow,
     cluster_intervals,
-    evaluate_rule,
+    evaluate_rule_with_maintenance,
     to_epoch,
     to_number,
+    union,
 )
 
 DEFAULT_DEVICE_FIELD = "device"
@@ -156,28 +158,81 @@ def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | No
     return events_by_channel, horizon
 
 
+def _load_maintenance_index() -> dict[str, list[Interval]]:
+    """Merge overlapping/touching maintenance windows per device.
+
+    The engine subtracts these per-rule; merging here satisfies the "coalesce
+    same-device overlap/touch first" rule and keeps a touching pair from
+    appearing to reset duration twice.
+    """
+    raw: dict[str, list[Interval]] = defaultdict(list)
+    for row in db.query("SELECT device, start_ts, end_ts FROM maintenance_windows"):
+        raw[row["device"]].append(Interval(row["start_ts"], row["end_ts"]))
+    return {device: union(ivs) for device, ivs in raw.items()}
+
+
+def _covering_windows(
+    windows_by_device: dict[str, list[MaintenanceWindow]],
+    devices: set[str],
+    start: float,
+    end: float,
+) -> list[MaintenanceWindow]:
+    """Raw windows (any of ``devices``) whose half-open interval covers/touches
+    [start, end) — i.e. the windows responsible for one suppressed fragment."""
+    hit: list[MaintenanceWindow] = []
+    for device in devices:
+        for w in windows_by_device.get(device, []):
+            if w.start < end and w.end > start:
+                hit.append(w)
+    hit.sort(key=lambda w: (w.start, w.end, w.id or 0))
+    return hit
+
+
 def evaluate_all_rules() -> dict:
-    """Re-evaluate every rule and replace its stored fault intervals."""
+    """Re-evaluate every rule and replace its stored fault intervals.
+
+    Scheduled-maintenance windows are merged per device first, then subtracted
+    from each rule's truth segments: maintenance interruptions reset duration
+    accumulation, only surviving pieces that still meet the duration become
+    faults, and the removed pieces are stored as suppressed intervals linked to
+    the raw windows that produced them.
+    """
     rules = db.fetch_rules()
     events_by_channel, horizon = _load_events_index()
     if horizon is None:
         horizon = 0.0
+    maintenance_by_device = _load_maintenance_index()
 
-    conn = db.get_conn()
+    raw_windows_by_device: dict[str, list[MaintenanceWindow]] = defaultdict(list)
+    for row in db.query("SELECT * FROM maintenance_windows ORDER BY start_ts, end_ts, id"):
+        raw_windows_by_device[row["device"]].append(
+            MaintenanceWindow(
+                device=row["device"],
+                start=row["start_ts"],
+                end=row["end_ts"],
+                name=row["name"],
+                id=row["id"],
+            )
+        )
+
     total = 0
+    suppressed_total = 0
     per_rule: list[dict] = []
     with db.transaction() as tx:
+        tx.execute("DELETE FROM fault_intervals")
+        tx.execute("DELETE FROM suppressed_intervals")
         for rule in rules:
             conditions = [Condition.from_dict(c) for c in rule["conditions"]]
-            faults = evaluate_rule(
+            faults, suppressed = evaluate_rule_with_maintenance(
                 rule_id=rule["id"],
                 logic=rule["logic"],
                 duration_required=rule["duration"],
                 conditions=conditions,
                 events_by_channel=events_by_channel,
                 horizon=horizon,
+                maintenance_by_device=maintenance_by_device,
             )
-            tx.execute("DELETE FROM fault_intervals WHERE rule_id = ?", (rule["id"],))
+            devices = {c.device for c in conditions}
             for f in faults:
                 tx.execute(
                     """
@@ -194,10 +249,39 @@ def evaluate_all_rules() -> dict:
                         json.dumps([e.to_dict() for e in f.evidence], ensure_ascii=False),
                     ),
                 )
+            for s in suppressed:
+                windows = _covering_windows(
+                    raw_windows_by_device, devices, s.start, s.end
+                )
+                tx.execute(
+                    """
+                    INSERT INTO suppressed_intervals (rule_id, start_ts, end_ts, window_ids_json)
+                    VALUES (?,?,?,?)
+                    """,
+                    (
+                        s.rule_id,
+                        s.start,
+                        s.end,
+                        json.dumps([w.id for w in windows]),
+                    ),
+                )
             total += len(faults)
-            per_rule.append({"rule_id": rule["id"], "rule_name": rule["name"], "faults": len(faults)})
+            suppressed_total += len(suppressed)
+            per_rule.append(
+                {
+                    "rule_id": rule["id"],
+                    "rule_name": rule["name"],
+                    "faults": len(faults),
+                    "suppressed": len(suppressed),
+                }
+            )
 
-    return {"rules_evaluated": len(rules), "fault_intervals": total, "per_rule": per_rule}
+    return {
+        "rules_evaluated": len(rules),
+        "fault_intervals": total,
+        "suppressed_intervals": suppressed_total,
+        "per_rule": per_rule,
+    }
 
 
 def list_channels() -> list[dict]:
@@ -393,6 +477,119 @@ def query_annotations(start: float | None = None, end: float | None = None) -> l
     ]
 
 
+def query_maintenance_windows(
+    start: float | None = None,
+    end: float | None = None,
+    device: str | None = None,
+) -> list[dict]:
+    """Maintenance windows overlapping the half-open [start,end) window."""
+    where = []
+    params: list = []
+    if start is not None:
+        where.append("end_ts > ?")
+        params.append(start)
+    if end is not None:
+        where.append("start_ts < ?")
+        params.append(end)
+    if device:
+        where.append("device = ?")
+        params.append(device)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    rows = db.query(
+        f"SELECT * FROM maintenance_windows{clause} ORDER BY device, start_ts, id",
+        params,
+    )
+    return [
+        {
+            "id": r["id"],
+            "device": r["device"],
+            "start": r["start_ts"],
+            "end": r["end_ts"],
+            "name": r["name"],
+            "note": r["note"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
+
+
+def query_suppressed(
+    start: float | None = None, end: float | None = None
+) -> list[dict]:
+    """Suppressed truth fragments (maintenance-covered), with their rules and
+    the raw maintenance windows responsible for the suppression."""
+    where = []
+    params: list = []
+    if start is not None:
+        where.append("s.end_ts > ?")
+        params.append(start)
+    if end is not None:
+        where.append("s.start_ts < ?")
+        params.append(end)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    rows = db.query(
+        f"""
+        SELECT s.*, r.name AS rule_name, r.logic
+        FROM suppressed_intervals s JOIN rules r ON r.id = s.rule_id
+        {clause} ORDER BY s.start_ts, s.rule_id
+        """,
+        params,
+    )
+    windows = {w["id"]: w for w in query_maintenance_windows(None, None)}
+    out = []
+    for row in rows:
+        window_ids = json.loads(row["window_ids_json"] or "[]")
+        out.append(
+            {
+                "id": row["id"],
+                "rule_id": row["rule_id"],
+                "rule_name": row["rule_name"],
+                "logic": row["logic"],
+                "start": row["start_ts"],
+                "end": row["end_ts"],
+                "window_ids": window_ids,
+                "windows": [windows[wid] for wid in window_ids if wid in windows],
+            }
+        )
+    return out
+
+
+def create_maintenance_window(
+    device: str, start: float, end: float, name: str, note: str | None = None
+) -> dict:
+    now = time.time()
+    cur = db.execute(
+        """
+        INSERT INTO maintenance_windows (device, start_ts, end_ts, name, note, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (device, start, end, name, note, now, now),
+    )
+    evaluate_all_rules()
+    return db.fetch_maintenance_window(cur.lastrowid)
+
+
+def update_maintenance_window(
+    window_id: int, device: str, start: float, end: float, name: str, note: str | None
+) -> dict:
+    db.execute(
+        """
+        UPDATE maintenance_windows
+        SET device = ?, start_ts = ?, end_ts = ?, name = ?, note = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (device, start, end, name, note, time.time(), window_id),
+    )
+    evaluate_all_rules()
+    return db.fetch_maintenance_window(window_id)
+
+
+def delete_maintenance_window(window_id: int) -> None:
+    db.execute("DELETE FROM maintenance_windows WHERE id = ?", (window_id,))
+    evaluate_all_rules()
+
+
 def downsample(values: list[tuple[float, float, int]], max_points: int) -> list[tuple[float, float, int]]:
     """Stride downsample; first/last points are always kept.
 
@@ -453,10 +650,17 @@ def timeline_data(start: float | None, end: float | None, max_points: int = 400)
         )
 
     bounds = db.query_one("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM events")
+    rules = db.fetch_rules()
     return {
         "channels": channel_payload,
         "faults": query_faults(start, end),
+        "suppressed": query_suppressed(start, end),
         "annotations": query_annotations(start, end),
+        "maintenance_windows": query_maintenance_windows(start, end),
+        # rule_id -> devices it references (for placing suppressed fragments)
+        "rule_devices": [
+            [r["id"], sorted({c["device"] for c in r["conditions"]})] for r in rules
+        ],
         "data_start": bounds["lo"],
         "data_end": bounds["hi"],
     }

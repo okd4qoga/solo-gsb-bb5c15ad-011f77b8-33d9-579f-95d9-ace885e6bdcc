@@ -77,6 +77,29 @@ CREATE TABLE IF NOT EXISTS annotations (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_annot_ts ON annotations(start_ts, end_ts);
+
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device TEXT NOT NULL,
+    start_ts REAL NOT NULL,
+    end_ts REAL NOT NULL,
+    name TEXT NOT NULL,
+    note TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_maint_device_ts ON maintenance_windows(device, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS idx_maint_ts ON maintenance_windows(start_ts, end_ts);
+
+CREATE TABLE IF NOT EXISTS suppressed_intervals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL REFERENCES rules(id) ON DELETE CASCADE,
+    start_ts REAL NOT NULL,
+    end_ts REAL NOT NULL,
+    window_ids_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_supp_rule ON suppressed_intervals(rule_id);
+CREATE INDEX IF NOT EXISTS idx_supp_ts ON suppressed_intervals(start_ts, end_ts);
 """
 
 
@@ -138,7 +161,16 @@ def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
 
 def reset_all() -> None:
     conn = get_conn()
-    for table in ("fault_intervals", "rule_conditions", "annotations", "rules", "events", "imports"):
+    for table in (
+        "fault_intervals",
+        "suppressed_intervals",
+        "rule_conditions",
+        "annotations",
+        "maintenance_windows",
+        "rules",
+        "events",
+        "imports",
+    ):
         conn.execute(f"DELETE FROM {table}")
     conn.commit()
 
@@ -229,3 +261,39 @@ def faults_for_export() -> list[dict]:
             }
         )
     return out
+
+
+def fetch_maintenance_windows() -> list[dict]:
+    """All maintenance windows, ordered by device then start time."""
+    rows = query(
+        "SELECT * FROM maintenance_windows ORDER BY device, start_ts, id"
+    )
+    return [
+        {
+            "id": r["id"],
+            "device": r["device"],
+            "start": r["start_ts"],
+            "end": r["end_ts"],
+            "name": r["name"],
+            "note": r["note"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
+
+
+def fetch_maintenance_window(window_id: int) -> dict | None:
+    row = query_one("SELECT * FROM maintenance_windows WHERE id = ?", (window_id,))
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "device": row["device"],
+        "start": row["start_ts"],
+        "end": row["end_ts"],
+        "name": row["name"],
+        "note": row["note"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }

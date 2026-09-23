@@ -9,6 +9,13 @@ Touching half-open intervals (``[a, b)`` followed by ``[b, c)``) are
 consecutive: a sweep-line that emits a segment only when the truth value
 actually changes merges them automatically, never emitting a zero-length
 "gap" or "reset" segment at ``b``.
+
+Scheduled-maintenance windows follow the same half-open model.  Overlapping
+or touching windows of one device are merged first, then subtracted from the
+truth segments of every rule the device participates in.  Subtraction splits
+a truth segment into independent pieces, so the required duration is counted
+anew on each piece: a maintenance interruption resets duration accumulation,
+and each surviving piece gets its own confirmation timestamp.
 """
 
 from __future__ import annotations
@@ -100,6 +107,61 @@ class Interval:
 
     def nonempty(self) -> bool:
         return self.end > self.start + _EPS
+
+
+@dataclass(frozen=True)
+class MaintenanceWindow:
+    """Named scheduled-maintenance window for one device, half-open [start, end)."""
+
+    device: str
+    start: float
+    end: float
+    name: str = ""
+    id: int | None = None
+
+    def __post_init__(self) -> None:
+        if not str(self.device).strip():
+            raise ValueError("maintenance device is required")
+        if not self.end > self.start:
+            raise ValueError("maintenance end must be greater than start")
+
+
+def subtract_intervals(
+    intervals: Iterable[Interval], holes: Iterable[Interval]
+) -> tuple[list[Interval], list[Interval]]:
+    """Subtract ``holes`` from ``intervals`` (both half-open).
+
+    Returns ``(pieces, removed)``: the surviving pieces of the input and the
+    removed sub-intervals (``intervals ∩ union(holes)``, touching pieces
+    merged).  Holes that merely touch an interval's boundary do not split it.
+    """
+    pieces: list[Interval] = []
+    removed: list[Interval] = []
+    merged_holes = union(holes)
+    if not merged_holes:
+        return list(intervals), []
+    for iv in intervals:
+        cursor = iv.start
+        for hole in merged_holes:
+            if hole.end <= cursor:
+                continue
+            if hole.start >= iv.end:
+                break
+            if hole.start > cursor:
+                pieces.append(Interval(cursor, min(hole.start, iv.end)))
+            removed.append(Interval(max(hole.start, iv.start), min(hole.end, iv.end)))
+            cursor = max(cursor, hole.end)
+            if cursor >= iv.end:
+                break
+        if cursor < iv.end:
+            pieces.append(Interval(cursor, iv.end))
+    return pieces, union(removed)
+
+
+def clip_interval(iv: Interval, start: float, end: float) -> Interval | None:
+    """``iv ∩ [start, end)`` as a half-open interval, or None when empty."""
+    lo, hi = max(iv.start, start), min(iv.end, end)
+    return Interval(lo, hi) if hi > lo else None
 
 
 def union(intervals: Iterable[Interval]) -> list[Interval]:
@@ -265,6 +327,20 @@ class FaultInterval:
         return self.end - self.start
 
 
+@dataclass
+class SuppressedInterval:
+    """Part of a rule's truth segment covered by scheduled maintenance.
+
+    ``[start, end)`` is the intersection of one truth segment with the merged
+    maintenance windows of the rule's devices; the raw window ids/names that
+    cover it are attached by the service layer.
+    """
+
+    start: float
+    end: float
+    rule_id: int
+
+
 def channel_held_intervals(
     events: list[Event], condition: Condition, horizon: float
 ) -> tuple[list[Interval], list[Event]]:
@@ -298,6 +374,40 @@ def _merge_or(per_condition: list[list[Interval]]) -> list[Interval]:
     return union(iv for ivs in per_condition for iv in ivs)
 
 
+def _build_fault(
+    rule_id: int,
+    duration_required: float,
+    conditions: list[Condition],
+    held_per: list[list[Interval]],
+    witnesses_per: list[list[Event]],
+    iv: Interval,
+) -> FaultInterval:
+    """Fault interval for one surviving truth piece, with per-condition evidence.
+
+    Evidence is clipped to the piece itself, so it can never cross a
+    maintenance boundary (or any other truth-segment edge).
+    """
+    evidence: list[EvidenceItem] = []
+    for cond, held, witnesses in zip(conditions, held_per, witnesses_per):
+        inside = [
+            clipped
+            for h in held
+            if (clipped := clip_interval(h, iv.start, iv.end)) is not None
+        ]
+        inside_events = [ev for ev in witnesses if iv.start <= ev.ts < iv.end]
+        evidence.append(
+            EvidenceItem(condition=cond, events=inside_events, held_intervals=inside)
+        )
+    return FaultInterval(
+        start=iv.start,
+        end=iv.end,
+        rule_id=rule_id,
+        duration_required=duration_required,
+        confirmed_at=iv.start + duration_required,
+        evidence=evidence,
+    )
+
+
 def evaluate_rule(
     rule_id: int,
     logic: str,
@@ -305,10 +415,41 @@ def evaluate_rule(
     conditions: list[Condition],
     events_by_channel: dict[tuple[str, str], list[Event]],
     horizon: float,
+    maintenance_by_device: dict[str, list[Interval]] | None = None,
 ) -> list[FaultInterval]:
     """Evaluate one rule against indexed channel data.
 
     Returns the merged fault intervals whose length is >= ``duration_required``.
+    """
+    faults, _ = evaluate_rule_with_maintenance(
+        rule_id,
+        logic,
+        duration_required,
+        conditions,
+        events_by_channel,
+        horizon,
+        maintenance_by_device,
+    )
+    return faults
+
+
+def evaluate_rule_with_maintenance(
+    rule_id: int,
+    logic: str,
+    duration_required: float,
+    conditions: list[Condition],
+    events_by_channel: dict[tuple[str, str], list[Event]],
+    horizon: float,
+    maintenance_by_device: dict[str, list[Interval]] | None = None,
+) -> tuple[list[FaultInterval], list[SuppressedInterval]]:
+    """Evaluate one rule, subtracting scheduled-maintenance windows.
+
+    ``maintenance_by_device`` maps a device to its already-merged (overlap-
+    and touch-coalesced) maintenance windows.  The windows of every device
+    the rule references are unioned and subtracted from the rule's truth
+    segments; each surviving piece is an independent duration accumulator
+    (maintenance resets the clock), and the removed parts are returned as
+    suppressed intervals for display/audit.
     """
     logic = logic.upper()
     if logic not in LOGIC:
@@ -317,7 +458,7 @@ def evaluate_rule(
     if duration_required < 0:
         raise ValueError("duration must be non-negative")
     if not conditions:
-        return []
+        return [], []
 
     held_per: list[list[Interval]] = []
     witnesses_per: list[list[Event]] = []
@@ -334,35 +475,30 @@ def evaluate_rule(
         # AND over channels that actually exist; a condition with no channel
         # data can never be satisfied.
         if any(cond.channel not in events_by_channel for cond in conditions):
-            return []
+            return [], []
         truth = intersect(held_per)
+
+    suppressed: list[SuppressedInterval] = []
+    if maintenance_by_device:
+        devices = {str(cond.device) for cond in conditions}
+        rule_windows = union(
+            iv
+            for device in devices
+            for iv in maintenance_by_device.get(device, [])
+        )
+        if rule_windows:
+            truth, removed = subtract_intervals(truth, rule_windows)
+            suppressed = [
+                SuppressedInterval(start=iv.start, end=iv.end, rule_id=rule_id)
+                for iv in removed
+            ]
 
     faults: list[FaultInterval] = []
     for iv in truth:
         if iv.end - iv.start + _EPS >= duration_required:
-            evidence: list[EvidenceItem] = []
-            for cond, held, witnesses in zip(conditions, held_per, witnesses_per):
-                inside = [
-                    h
-                    for h in held
-                    if h.start < iv.end and h.end > iv.start
-                ]
-                inside_events = [
-                    ev
-                    for ev in witnesses
-                    if iv.start <= ev.ts < iv.end
-                ]
-                evidence.append(
-                    EvidenceItem(condition=cond, events=inside_events, held_intervals=inside)
-                )
             faults.append(
-                FaultInterval(
-                    start=iv.start,
-                    end=iv.end,
-                    rule_id=rule_id,
-                    duration_required=duration_required,
-                    confirmed_at=iv.start + duration_required,
-                    evidence=evidence,
+                _build_fault(
+                    rule_id, duration_required, conditions, held_per, witnesses_per, iv
                 )
             )
-    return faults
+    return faults, suppressed

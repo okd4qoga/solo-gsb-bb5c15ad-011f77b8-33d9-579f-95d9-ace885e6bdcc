@@ -84,6 +84,39 @@
 
       <datalist id="device-list"></datalist>
       <datalist id="metric-list"></datalist>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>计划维护</h2>
+          <button id="btn-new-maint" class="btn btn-small">＋ 新建</button>
+        </div>
+        <p class="muted small">按设备登记带名称的半开维护窗口；评估时先合并同设备重叠/相接窗口，再从该设备参与规则的真值段中扣除，中断会重置持续时长。</p>
+        <div id="maint-list" class="maint-list"></div>
+        <div id="maint-editor" hidden>
+          <h3 id="maint-editor-title">新建维护窗口</h3>
+          <label class="field">设备
+            <input id="maint-device" list="device-list" placeholder="例如：pump-1" />
+          </label>
+          <label class="field">名称
+            <input id="maint-name" placeholder="例如：例行检修" />
+          </label>
+          <div class="field-row">
+            <label class="field">开始
+              <input id="maint-start" type="datetime-local" step="1" />
+            </label>
+            <label class="field">结束
+              <input id="maint-end" type="datetime-local" step="1" />
+            </label>
+          </div>
+          <label class="field">备注（可选）
+            <input id="maint-note" />
+          </label>
+          <div class="editor-actions">
+            <button id="btn-save-maint" class="btn btn-primary">保存</button>
+            <button id="btn-cancel-maint" class="btn">取消</button>
+          </div>
+        </div>
+      </section>
     </aside>
 
     <main class="content">
@@ -99,16 +132,21 @@
       <section class="card timeline-card">
         <div class="card-head">
           <h2>时间轴</h2>
-          <span class="muted small">在图上按住拖拽即可框选并创建区间标注；点击故障色块查看触发证据</span>
+          <span class="muted small">在图上按住拖拽框选，可创建区间标注或计划维护窗口；点击故障色块查看触发证据</span>
         </div>
         <div id="timeline-wrap">
           <svg id="timeline"></svg>
           <div id="brush-pop" hidden>
             <div id="brush-time" class="small muted"></div>
-            <input id="brush-label" placeholder="标注名称，如：计划检修" />
+            <select id="brush-type">
+              <option value="annotation">类型：区间标注</option>
+              <option value="maintenance">类型：计划维护</option>
+            </select>
+            <input id="brush-device" list="device-list" placeholder="维护设备，如 pump-1" hidden />
+            <input id="brush-label" placeholder="名称，如：计划检修" />
             <input id="brush-note" placeholder="备注（可选）" />
             <div class="brush-actions">
-              <button id="brush-save" class="btn btn-small btn-primary">创建标注</button>
+              <button id="brush-save" class="btn btn-small btn-primary">创建</button>
               <button id="brush-cancel" class="btn btn-small">取消</button>
             </div>
           </div>
@@ -128,6 +166,7 @@
         <div id="fault-event-hint" class="muted small" hidden>
           不同规则产生、时间区间<b>重叠或首尾相接</b>（含传递链）的故障归为同一事件；事件区间为成员最早开始至最晚结束。原始故障结果不受影响。
         </div>
+        <div id="maint-hint" class="muted small" hidden></div>
         <div id="fault-list"></div>
         <div id="fault-event-list" hidden></div>
       </section>

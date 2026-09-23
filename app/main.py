@@ -88,6 +88,30 @@ class AnnotationIn(BaseModel):
         return start, end
 
 
+class MaintenanceIn(BaseModel):
+    device: str = Field(min_length=1, max_length=200)
+    start: Any
+    end: Any
+    name: str = Field(min_length=1, max_length=200)
+    note: str | None = None
+
+    def normalized(self) -> dict:
+        try:
+            start = to_epoch(self.start)
+            end = to_epoch(self.end)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if end <= start:
+            raise HTTPException(status_code=400, detail="maintenance end must be greater than start")
+        return {
+            "device": self.device.strip(),
+            "start": start,
+            "end": end,
+            "name": self.name.strip(),
+            "note": (self.note.strip() or None) if self.note is not None else None,
+        }
+
+
 class ImportBody(BaseModel):
     text: str = ""
     filename: str | None = None
@@ -126,6 +150,18 @@ DEMO_RULES = [
 
 SAMPLE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "samples", "telemetry.jsonl")
 
+# Demo maintenance window: pump-1 is maintained for 2 minutes in the middle of
+# its 11-minute high-temperature episode [00:06,00:17).  The first 5-minute
+# piece [00:06,00:11) already meets the 5-minute duration; the maintenance
+# resets accumulation, so the 4-minute tail [00:13,00:17) no longer qualifies.
+DEMO_MAINTENANCE = {
+    "device": "pump-1",
+    "start": "2026-09-23T00:11:00Z",
+    "end": "2026-09-23T00:13:00Z",
+    "name": "pump-1 计划检修（2 分钟）",
+    "note": "示例维护窗口：高温连续时长被中断，00:13 后重新累计。",
+}
+
 
 # --------------------------------------------------------------------------- #
 # Health / meta
@@ -147,6 +183,7 @@ def meta() -> dict:
         "data_end": bounds["hi"],
         "event_count": db.query_one("SELECT COUNT(*) AS c FROM events")["c"],
         "rule_count": db.query_one("SELECT COUNT(*) AS c FROM rules")["c"],
+        "maintenance_count": db.query_one("SELECT COUNT(*) AS c FROM maintenance_windows")["c"],
     }
 
 
@@ -338,6 +375,48 @@ def delete_annotation(ann_id: int) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Scheduled maintenance
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/maintenance")
+def get_maintenance(
+    start: str | None = None,
+    end: str | None = None,
+    device: str | None = None,
+) -> list[dict]:
+    return services.query_maintenance_windows(parse_bound(start), parse_bound(end), device)
+
+
+@app.post("/api/maintenance")
+def create_maintenance(m: MaintenanceIn) -> dict:
+    data = m.normalized()
+    return services.create_maintenance_window(**data)
+
+
+@app.put("/api/maintenance/{window_id}")
+def update_maintenance(window_id: int, m: MaintenanceIn) -> dict:
+    if db.fetch_maintenance_window(window_id) is None:
+        raise HTTPException(status_code=404, detail="maintenance window not found")
+    data = m.normalized()
+    return services.update_maintenance_window(window_id, **data)
+
+
+@app.delete("/api/maintenance/{window_id}")
+def delete_maintenance(window_id: int) -> dict:
+    if db.fetch_maintenance_window(window_id) is None:
+        raise HTTPException(status_code=404, detail="maintenance window not found")
+    services.delete_maintenance_window(window_id)
+    return {"deleted": window_id}
+
+
+@app.get("/api/suppressed")
+def get_suppressed(start: str | None = None, end: str | None = None) -> list[dict]:
+    """Truth fragments suppressed by scheduled maintenance (with rule + windows)."""
+    return services.query_suppressed(parse_bound(start), parse_bound(end))
+
+
+# --------------------------------------------------------------------------- #
 # Timeline / export / reset
 # --------------------------------------------------------------------------- #
 
@@ -365,6 +444,8 @@ def export(
     )
     faults = [f for f in services.query_faults(start_ts, end_ts)]
     annotations = services.query_annotations(start_ts, end_ts)
+    maintenance = services.query_maintenance_windows(start_ts, end_ts)
+    suppressed = services.query_suppressed(start_ts, end_ts)
 
     # Split fault evidence into explicit per-condition evidence references so
     # the export carries raw events, fault intervals and their trigger proof.
@@ -389,7 +470,7 @@ def export(
         "time_range": {
             "start": start_ts,
             "end": end_ts,
-            "note": "events filtered inclusively; fault intervals/annotations overlap the half-open [start,end) window",
+            "note": "events filtered inclusively; fault/maintenance/annotation intervals overlap the half-open [start,end) window",
         },
         "rules": db.fetch_rules(),
         "events": events,
@@ -398,6 +479,8 @@ def export(
         "evidence_only_events": referenced_events,
         "fault_intervals": faults,
         "fault_events": services.query_fault_events(start_ts, end_ts),
+        "maintenance_windows": maintenance,
+        "suppressed_intervals": suppressed,
         "annotations": annotations,
     }
 
@@ -434,12 +517,34 @@ def demo() -> dict:
             continue
         _insert_rule(data)
         created += 1
+
+    maint = MaintenanceIn(**DEMO_MAINTENANCE).normalized()
+    existing_window = db.query_one(
+        "SELECT id FROM maintenance_windows WHERE device = ? AND start_ts = ? AND end_ts = ? AND name = ?",
+        (maint["device"], maint["start"], maint["end"], maint["name"]),
+    )
+    if existing_window is None:
+        db.execute(
+            """
+            INSERT INTO maintenance_windows (device, start_ts, end_ts, name, note, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                maint["device"], maint["start"], maint["end"], maint["name"],
+                maint["note"], time.time(), time.time(),
+            ),
+        )
+        maintenance_created = 1
+    else:
+        maintenance_created = 0
+
     return {
         "inserted": result["inserted"],
         "overwritten": result["overwritten"],
         "skipped": result["skipped"],
         "rules_created": created,
-        "note": "规则已创建，点击「评估规则」生成故障区间（本接口不自动评估）",
+        "maintenance_created": maintenance_created,
+        "note": "规则与示例维护窗口已就绪，点击「评估规则」生成扣除维护后的故障区间（本接口不自动评估）",
     }
 
 
