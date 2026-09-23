@@ -82,6 +82,43 @@
         </div>
       </section>
 
+      <section class="card">
+        <div class="card-head">
+          <h2>计划维护</h2>
+          <button id="btn-new-maint" class="btn btn-small">＋ 新建</button>
+        </div>
+        <div class="muted small maint-hint">
+          维护窗口为半开区间 [start, end)：评估时同设备重叠/相接窗口先合并，再从该设备参与规则的真值段中扣除；
+          中断会重置持续时长，窗口结束后重新累计确认。保存后自动重新评估。
+        </div>
+        <div id="maint-list" class="maint-list"></div>
+
+        <div id="maint-editor" hidden>
+          <h3 id="maint-editor-title">新建维护窗口</h3>
+          <label class="field">设备
+            <input id="maint-device" list="device-list" placeholder="例如：pump-1" />
+          </label>
+          <label class="field">名称
+            <input id="maint-name" placeholder="例如：季度检修" />
+          </label>
+          <div class="field-row">
+            <label class="field">开始
+              <input id="maint-start" type="datetime-local" step="1" />
+            </label>
+            <label class="field">结束
+              <input id="maint-end" type="datetime-local" step="1" />
+            </label>
+          </div>
+          <label class="field">备注（可选）
+            <input id="maint-note" placeholder="维护内容说明" />
+          </label>
+          <div class="editor-actions">
+            <button id="btn-save-maint" class="btn btn-primary">保存并重新评估</button>
+            <button id="btn-cancel-maint" class="btn">取消</button>
+          </div>
+        </div>
+      </section>
+
       <datalist id="device-list"></datalist>
       <datalist id="metric-list"></datalist>
     </aside>
@@ -99,16 +136,21 @@
       <section class="card timeline-card">
         <div class="card-head">
           <h2>时间轴</h2>
-          <span class="muted small">在图上按住拖拽即可框选并创建区间标注；点击故障色块查看触发证据</span>
+          <span class="muted small">在图上按住拖拽即可框选并创建区间标注或维护窗口；点击故障色块查看触发证据</span>
         </div>
         <div id="timeline-wrap">
           <svg id="timeline"></svg>
           <div id="brush-pop" hidden>
             <div id="brush-time" class="small muted"></div>
-            <input id="brush-label" placeholder="标注名称，如：计划检修" />
+            <div class="brush-kind">
+              <label><input type="radio" name="brush-kind" value="annotation" checked /> 区间标注</label>
+              <label><input type="radio" name="brush-kind" value="maintenance" /> 维护窗口</label>
+            </div>
+            <input id="brush-label" placeholder="名称，如：计划检修" />
+            <input id="brush-device" list="device-list" placeholder="设备（维护窗口必填）" hidden />
             <input id="brush-note" placeholder="备注（可选）" />
             <div class="brush-actions">
-              <button id="brush-save" class="btn btn-small btn-primary">创建标注</button>
+              <button id="brush-save" class="btn btn-small btn-primary">创建</button>
               <button id="brush-cancel" class="btn btn-small">取消</button>
             </div>
           </div>

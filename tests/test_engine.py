@@ -112,7 +112,7 @@ def test_duration_filters_short_spike():
     # >=80 for 11 minutes [6,17); an isolated 1-minute spike at t=20
     events = minute_series(100, lambda m: 90 if (6 <= m <= 16 or m == 20) else 10)
     cond = Condition("d", "m", ">=", 80)
-    faults = evaluate_rule(1, "AND", 300, [cond], {("d", "m"): events}, horizon=30 * 60)
+    faults = evaluate_rule(1, "AND", 300, [cond], {("d", "m"): events}, horizon=30 * 60).faults
     assert ivs(faults) == [(6 * 60, 17 * 60)]
     assert faults[0].confirmed_at == 6 * 60 + 300
     evidence = faults[0].evidence[0]
@@ -130,7 +130,7 @@ def test_and_rule_intersection_with_duration():
         [Condition("d", "temp", ">=", 80), Condition("d", "vib", ">", 3)],
         {("d", "temp"): temp, ("d", "vib"): vib},
         horizon=30 * 60,
-    )
+    ).faults
     assert ivs(faults) == [(12 * 60, 14 * 60)]
 
 
@@ -145,7 +145,7 @@ def test_or_touching_intervals_merge_across_channels():
         [Condition("d", "vib", ">", 5), Condition("d", "press", "<", 30)],
         {("d", "vib"): vib, ("d", "press"): press},
         horizon=30 * 60,
-    )
+    ).faults
     assert ivs(faults) == [(3 * 60, 9 * 60), (10 * 60, 14 * 60)]
     assert math.isclose(faults[0].end - faults[0].start, 6 * 60)
     groups = {g.condition.metric: g for g in faults[0].evidence}
@@ -169,7 +169,7 @@ def test_or_separate_short_windows_filtered_by_duration():
         [Condition("d", "vib", ">", 5), Condition("d", "press", "<", 30)],
         {("d", "vib"): vib, ("d", "press"): press},
         horizon=30 * 60,
-    )
+    ).faults
     # [3,7) is 4 min >= 200s -> fault; [10,12) is 2 min -> filtered
     assert ivs(faults) == [(3 * 60, 7 * 60)]
 
@@ -183,5 +183,5 @@ def test_and_missing_channel_never_matches():
         [Condition("d", "temp", ">", 50), Condition("d", "missing", ">", 0)],
         events,
         horizon=10,
-    )
+    ).faults
     assert faults == []

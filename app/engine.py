@@ -190,6 +190,51 @@ def intersect(intervals: Iterable[Interval]) -> list[Interval]:
     return result
 
 
+def subtract(a: list[Interval], b: list[Interval]) -> list[Interval]:
+    """Set difference of two pre-merged half-open interval lists.
+
+    Everything in ``a`` not covered by ``b``; touching boundaries carry no
+    point of the half-open model, so subtracting ``[b0, b1)`` only removes the
+    covered interior (``a`` ending exactly at ``b0`` is left intact).
+    """
+    if not a or not b:
+        return list(a)
+    result: list[Interval] = []
+    j = 0
+    for iv in a:
+        cur = iv.start
+        while j < len(b) and b[j].end <= iv.start:
+            j += 1
+        k = j
+        while k < len(b) and b[k].start < iv.end:
+            cut = b[k]
+            if cut.start > cur:
+                result.append(Interval(cur, min(cut.start, iv.end)))
+            cur = max(cur, min(cut.end, iv.end))
+            if cur >= iv.end:
+                break
+            k += 1
+        if cur < iv.end:
+            result.append(Interval(cur, iv.end))
+    return result
+
+
+def merge_device_windows(
+    windows: Iterable[tuple[str, float, float]],
+) -> dict[str, list[Interval]]:
+    """Merge overlapping or touching maintenance windows, grouped by device.
+
+    ``[a,b)`` and ``[b,c)`` on the same device touch and become one
+    ``[a,c)``; windows on different devices are never merged.  Zero-length
+    windows are dropped.
+    """
+    by_device: dict[str, list[Interval]] = defaultdict(list)
+    for device, start, end in windows:
+        if end > start:
+            by_device[str(device)].append(Interval(float(start), float(end)))
+    return {device: union(ivs) for device, ivs in by_device.items()}
+
+
 @dataclass
 class Condition:
     device: str
@@ -265,6 +310,38 @@ class FaultInterval:
         return self.end - self.start
 
 
+@dataclass
+class MaintenanceWindow:
+    """A named, half-open planned-maintenance window on one device."""
+
+    id: int
+    device: str
+    start: float
+    end: float
+    name: str = ""
+
+
+@dataclass
+class SuppressedSegment:
+    """Truth the rule *would* have had that was suppressed by maintenance.
+
+    ``interval`` is always a piece of (raw truth − effective truth) ∩
+    (this condition's held intervals) ∩ (merged maintenance of its device):
+    the exact span where maintenance knocked the rule's truth out.
+    """
+
+    device: str
+    metric: str
+    interval: Interval
+    maintenance_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class RuleEvaluation:
+    faults: list[FaultInterval] = field(default_factory=list)
+    suppressed: list[SuppressedSegment] = field(default_factory=list)
+
+
 def channel_held_intervals(
     events: list[Event], condition: Condition, horizon: float
 ) -> tuple[list[Interval], list[Event]]:
@@ -305,10 +382,21 @@ def evaluate_rule(
     conditions: list[Condition],
     events_by_channel: dict[tuple[str, str], list[Event]],
     horizon: float,
-) -> list[FaultInterval]:
+    maintenance: list[MaintenanceWindow] | None = None,
+) -> RuleEvaluation:
     """Evaluate one rule against indexed channel data.
 
-    Returns the merged fault intervals whose length is >= ``duration_required``.
+    Planned maintenance is applied *before* combining conditions: per device,
+    overlapping or touching windows are merged into maximal half-open spans,
+    then subtracted from every held interval of that device's channels.  A
+    maintenance span therefore cuts the rule's truth, **resets the sustained
+    duration** (each surviving truth segment re-accumulates from its own
+    start, so ``confirmed_at = segment.start + duration``) and clips trigger
+    evidence so it never crosses a maintenance boundary.
+
+    Returns the surviving fault intervals (length >= ``duration_required``)
+    plus the suppressed segments: spans where the rule's truth was lost to
+    maintenance, attributed per condition channel and source window.
     """
     logic = logic.upper()
     if logic not in LOGIC:
@@ -317,25 +405,65 @@ def evaluate_rule(
     if duration_required < 0:
         raise ValueError("duration must be non-negative")
     if not conditions:
-        return []
+        return RuleEvaluation()
 
+    windows = maintenance or []
+    merged_by_device = merge_device_windows(
+        (w.device, w.start, w.end) for w in windows
+    )
+    window_ids_by_device: dict[str, list[int]] = defaultdict(list)
+    for w in windows:
+        if w.end > w.start:
+            window_ids_by_device[str(w.device)].append(w.id)
+
+    raw_held_per: list[list[Interval]] = []
     held_per: list[list[Interval]] = []
     witnesses_per: list[list[Event]] = []
     for cond in conditions:
         ivs, witnesses = channel_held_intervals(
             events_by_channel.get(cond.channel, []), cond, horizon
         )
-        held_per.append(ivs)
+        raw_held_per.append(ivs)
+        maint = merged_by_device.get(str(cond.device))
+        held_per.append(subtract(ivs, maint) if maint else ivs)
         witnesses_per.append(witnesses)
 
-    if logic == "OR":
-        truth = _merge_or(held_per)
-    else:
-        # AND over channels that actually exist; a condition with no channel
-        # data can never be satisfied.
-        if any(cond.channel not in events_by_channel for cond in conditions):
-            return []
-        truth = intersect(held_per)
+    # AND over channels that actually exist; a condition with no channel
+    # data can never be satisfied.
+    if logic == "AND" and any(
+        cond.channel not in events_by_channel for cond in conditions
+    ):
+        return RuleEvaluation()
+
+    def combine(held_lists: list[list[Interval]]) -> list[Interval]:
+        if logic == "OR":
+            return _merge_or(held_lists)
+        return intersect(held_lists)
+
+    truth = combine(held_per)
+
+    suppressed: list[SuppressedSegment] = []
+    if windows:
+        # Spans where the rule's truth existed before maintenance but is gone
+        # after; suppressed pieces are clipped to these spans so they mark
+        # exactly where maintenance knocked the rule out.
+        lost = subtract(combine(raw_held_per), truth)
+        if lost:
+            for cond, raw_held in zip(conditions, raw_held_per):
+                maint = merged_by_device.get(str(cond.device))
+                if not maint:
+                    continue
+                for piece in intersect([raw_held, maint, lost]):
+                    suppressed.append(
+                        SuppressedSegment(
+                            device=str(cond.device),
+                            metric=str(cond.metric),
+                            interval=piece,
+                            maintenance_ids=sorted(
+                                window_ids_by_device.get(str(cond.device), [])
+                            ),
+                        )
+                    )
 
     faults: list[FaultInterval] = []
     for iv in truth:
@@ -365,4 +493,4 @@ def evaluate_rule(
                     evidence=evidence,
                 )
             )
-    return faults
+    return RuleEvaluation(faults=faults, suppressed=suppressed)

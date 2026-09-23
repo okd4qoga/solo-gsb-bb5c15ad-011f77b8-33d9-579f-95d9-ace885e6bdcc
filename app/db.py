@@ -77,6 +77,30 @@ CREATE TABLE IF NOT EXISTS annotations (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_annot_ts ON annotations(start_ts, end_ts);
+
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device TEXT NOT NULL,
+    name TEXT NOT NULL,
+    start_ts REAL NOT NULL,
+    end_ts REAL NOT NULL,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_maint_device ON maintenance_windows(device, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS idx_maint_ts ON maintenance_windows(start_ts, end_ts);
+
+CREATE TABLE IF NOT EXISTS suppressed_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL REFERENCES rules(id) ON DELETE CASCADE,
+    device TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    start_ts REAL NOT NULL,
+    end_ts REAL NOT NULL,
+    maintenance_ids TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_supp_rule ON suppressed_segments(rule_id);
+CREATE INDEX IF NOT EXISTS idx_supp_ts ON suppressed_segments(start_ts, end_ts);
 """
 
 
@@ -138,7 +162,16 @@ def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
 
 def reset_all() -> None:
     conn = get_conn()
-    for table in ("fault_intervals", "rule_conditions", "annotations", "rules", "events", "imports"):
+    for table in (
+        "fault_intervals",
+        "suppressed_segments",
+        "rule_conditions",
+        "annotations",
+        "maintenance_windows",
+        "rules",
+        "events",
+        "imports",
+    ):
         conn.execute(f"DELETE FROM {table}")
     conn.commit()
 
@@ -203,6 +236,46 @@ def upsert_event(
         (value, raw, import_id, existing["id"]),
     )
     return False
+
+
+def fetch_maintenance_window(window_id: int) -> dict | None:
+    row = query_one("SELECT * FROM maintenance_windows WHERE id = ?", (window_id,))
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "device": row["device"],
+        "name": row["name"],
+        "start": row["start_ts"],
+        "end": row["end_ts"],
+        "note": row["note"],
+        "created_at": row["created_at"],
+    }
+
+
+def fetch_maintenance_windows(
+    start: float | None = None,
+    end: float | None = None,
+    device: str | None = None,
+) -> list[dict]:
+    """Windows overlapping the half-open filter window [start, end)."""
+    where = []
+    params: list = []
+    if start is not None:
+        where.append("end_ts > ?")
+        params.append(start)
+    if end is not None:
+        where.append("start_ts < ?")
+        params.append(end)
+    if device:
+        where.append("device = ?")
+        params.append(device)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    rows = query(
+        f"SELECT id FROM maintenance_windows{clause} ORDER BY start_ts, device, id",
+        params,
+    )
+    return [w for w in (fetch_maintenance_window(r["id"]) for r in rows) if w]
 
 
 def faults_for_export() -> list[dict]:

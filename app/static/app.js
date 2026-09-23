@@ -4,6 +4,8 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
 const PALETTE = ["#ef4444", "#8b5cf6", "#0ea5e9", "#10b981", "#f59e0b", "#ec4899", "#14b8a6", "#f97316"];
 const ANN_COLOR = "#f59e0b";
+const MAINT_COLOR = "#0d9488";
+const SUPP_COLOR = "#b45309";
 
 const state = {
   rules: [],
@@ -18,6 +20,7 @@ const state = {
   expandedEventId: null,
   selectedFaultId: null,
   editingRuleId: null,
+  editingMaintenanceId: null,
   eventOffset: 0,
   eventLimit: 200,
   eventTotal: 0,
@@ -139,6 +142,7 @@ function renderRules() {
   const devs = new Set(), mets = new Set();
   state.channels.forEach((c) => { devs.add(c.device); mets.add(c.metric); });
   state.rules.forEach((r) => r.conditions.forEach((c) => { devs.add(c.device); mets.add(c.metric); }));
+  (state.timeline ? state.timeline.maintenance || [] : []).forEach((w) => devs.add(w.device));
   $("device-list").innerHTML = [...devs].map((d) => `<option value="${esc(d)}">`).join("");
   $("metric-list").innerHTML = [...mets].map((m) => `<option value="${esc(m)}">`).join("");
 }
@@ -228,13 +232,96 @@ async function evaluateRules() {
     await loadFaultEvents();
     renderFaults();
     renderFaultEvents();
-    toast(`评估完成：${r.rules_evaluated} 条规则，${r.fault_intervals} 个故障区间`);
+    toast(`评估完成：${r.rules_evaluated} 条规则，${r.fault_intervals} 个故障区间` +
+      (r.suppressed_segments ? `，${r.suppressed_segments} 段被维护抑制` : ""));
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ---------------------------- planned maintenance ---------------------------- */
+
+function renderMaintenance() {
+  const list = state.timeline ? state.timeline.maintenance || [] : [];
+  const box = $("maint-list");
+  if (!list.length) {
+    box.innerHTML = `<div class="empty">尚无维护窗口。点击「新建」或在时间轴上拖拽框选创建。</div>`;
+    return;
+  }
+  box.innerHTML = list.map((w) => `
+    <div class="maint-item" data-id="${w.id}">
+      <div class="rname">
+        <span class="swatch" style="background:${MAINT_COLOR}"></span>
+        <span>${esc(w.name)}</span>
+        <span class="rule-ops">
+          <button class="icon-btn act-edit" title="编辑">✎</button>
+          <button class="icon-btn act-del" title="删除">✕</button>
+        </span>
+      </div>
+      <div class="rmeta">${esc(w.device)} · ${fmtTime(w.start)} → ${fmtTime(w.end)}（${fmtDur(w.end - w.start)}）</div>
+      ${w.note ? `<div class="rmeta">${esc(w.note)}</div>` : ""}
+    </div>`).join("");
+
+  box.querySelectorAll(".maint-item").forEach((el) => {
+    const id = Number(el.dataset.id);
+    el.querySelector(".act-edit").addEventListener("click", (e) => { e.stopPropagation(); openMaintEditor(id); });
+    el.querySelector(".act-del").addEventListener("click", (e) => { e.stopPropagation(); deleteMaintenance(id); });
+    el.addEventListener("click", () => openMaintEditor(id));
+  });
+}
+
+function openMaintEditor(windowId = null, preset = null) {
+  const list = state.timeline ? state.timeline.maintenance || [] : [];
+  const w = windowId ? list.find((x) => x.id === windowId) : null;
+  state.editingMaintenanceId = w ? w.id : null;
+  $("maint-editor-title").textContent = w ? "编辑维护窗口" : "新建维护窗口";
+  $("maint-device").value = w ? w.device : (preset && preset.device) || "";
+  $("maint-name").value = w ? w.name : "";
+  $("maint-start").value = w ? toLocalInput(w.start) : preset ? toLocalInput(preset.start) : "";
+  $("maint-end").value = w ? toLocalInput(w.end) : preset ? toLocalInput(preset.end) : "";
+  $("maint-note").value = w && w.note ? w.note : "";
+  $("maint-editor").hidden = false;
+}
+
+function closeMaintEditor() {
+  state.editingMaintenanceId = null;
+  $("maint-editor").hidden = true;
+}
+
+async function saveMaintenance() {
+  const start = fromLocalInput($("maint-start").value);
+  const end = fromLocalInput($("maint-end").value);
+  const payload = {
+    device: $("maint-device").value.trim(),
+    name: $("maint-name").value.trim(),
+    start, end,
+    note: $("maint-note").value.trim() || null,
+  };
+  if (!payload.device || !payload.name) { toast("请填写设备与名称", true); return; }
+  if (start === null || end === null || end <= start) { toast("请填写有效的开始/结束时间（半开区间）", true); return; }
+  try {
+    // 服务端在写入后自动重新评估全部规则
+    if (state.editingMaintenanceId) {
+      await api(`/api/maintenance/${state.editingMaintenanceId}`, { method: "PUT", body: JSON.stringify(payload) });
+    } else {
+      await api("/api/maintenance", { method: "POST", body: JSON.stringify(payload) });
+    }
+    closeMaintEditor();
+    await reloadAll();
+    toast("维护窗口已保存，规则已重新评估");
+  } catch (e) { toast(e.message, true); }
+}
+
+async function deleteMaintenance(id) {
+  if (!confirm("删除该维护窗口并重新评估全部规则？")) return;
+  try {
+    await api(`/api/maintenance/${id}`, { method: "DELETE" });
+    await reloadAll();
+    toast("维护窗口已删除，规则已重新评估");
   } catch (e) { toast(e.message, true); }
 }
 
 /* ------------------------------ timeline ------------------------------ */
 
-const TL = { laneH: 64, laneGap: 14, top: 26, bottom: 26, left: 150, right: 26, annoH: 20, faultBands: 3 };
+const TL = { laneH: 64, laneGap: 14, top: 26, bottom: 26, left: 150, right: 26, annoH: 20, maintH: 16, faultBands: 3 };
 
 function xScale(epoch) {
   const width = state.svgWidth;
@@ -280,10 +367,27 @@ function renderTimeline() {
 
   state.svgWidth = wrap.clientWidth || 800;
   const channels = data.channels;
+  const maintenance = data.maintenance || [];
+  const suppressed = data.suppressed || [];
+  const maintLanes = stackLanes(maintenance);
+  const maintRows = maintenance.length ? Math.max(...maintLanes.values()) + 1 : 0;
+  const maintBand = maintenance.length ? maintRows * (TL.maintH + 2) + 6 : 0;
   const annoBand = data.annotations.length ? TL.annoH + 8 : 0;
-  const totalH = TL.top + annoBand + channels.length * (TL.laneH + TL.laneGap) + TL.bottom;
+  const totalH = TL.top + maintBand + annoBand + channels.length * (TL.laneH + TL.laneGap) + TL.bottom;
   svg.setAttribute("width", state.svgWidth);
   svg.setAttribute("height", totalH);
+
+  // hatch patterns for maintenance bands and suppressed segments
+  const defs = el("defs");
+  const mkPattern = (id, color) => {
+    const p = el("pattern", { id, width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" });
+    p.appendChild(el("rect", { width: 6, height: 6, fill: color, "fill-opacity": 0.08 }));
+    p.appendChild(el("line", { x1: 0, y1: 0, x2: 0, y2: 6, stroke: color, "stroke-width": 1.6, "stroke-opacity": 0.5 }));
+    return p;
+  };
+  defs.appendChild(mkPattern("maintHatch", MAINT_COLOR));
+  defs.appendChild(mkPattern("suppHatch", SUPP_COLOR));
+  svg.appendChild(defs);
 
   // time axis ticks
   const axisY = totalH - TL.bottom + 4;
@@ -297,11 +401,33 @@ function renderTimeline() {
   }
   svg.appendChild(axis);
 
-  const laneTop0 = TL.top + annoBand;
+  const laneTop0 = TL.top + maintBand + annoBand;
+
+  // maintenance band (planned maintenance windows, stacked like annotations)
+  if (maintenance.length) {
+    maintenance.forEach((w) => {
+      const my = TL.top + maintLanes.get(w.id) * (TL.maintH + 2);
+      const x1 = xScale(Math.max(w.start, state.viewStart));
+      const x2 = xScale(Math.min(w.end, state.viewEnd));
+      if (x2 <= x1) return;
+      const g = el("g", { class: "maint-band" });
+      g.appendChild(el("rect", { x: x1, y: my, width: x2 - x1, height: TL.maintH, class: "maint-rect" }));
+      g.appendChild(el("line", { x1, y1: my, x2: x1, y2: my + TL.maintH, class: "maint-edge" }));
+      g.appendChild(el("line", { x1: x2, y1: my, x2: x2, y2: my + TL.maintH, class: "maint-edge" }));
+      g.appendChild(el("text", {
+        x: Math.min(x1 + 4, state.svgWidth - TL.right - 4), y: my + 12,
+        class: "maint-label-text", text: `🛠 ${w.device} · ${w.name}`.slice(0, 36),
+      }));
+      attachTip(g, () =>
+        `维护窗口：${w.name}\n设备 ${w.device}\n${fmtTime(w.start)} → ${fmtTime(w.end)}（${fmtDur(w.end - w.start)}）` +
+        `${w.note ? "\n" + w.note : ""}\n半开区间 [start, end)，评估时从该设备真值段中扣除`);
+      svg.appendChild(g);
+    });
+  }
 
   // annotation band
   if (data.annotations.length) {
-    const ay = TL.top;
+    const ay = TL.top + maintBand;
     data.annotations.forEach((a) => {
       const x1 = xScale(Math.max(a.start, state.viewStart));
       const x2 = xScale(Math.min(a.end, state.viewEnd));
@@ -330,6 +456,15 @@ function renderTimeline() {
     const g = el("g", { class: "lane" });
 
     g.appendChild(el("rect", { x: TL.left, y: laneY, width: state.svgWidth - TL.left - TL.right, height: TL.laneH, class: "lane-bg", rx: 4 }));
+
+    // maintenance shading: every window on this channel's device
+    maintenance.filter((w) => w.device === ch.device).forEach((w) => {
+      const x1 = xScale(Math.max(w.start, state.viewStart));
+      const x2 = xScale(Math.min(w.end, state.viewEnd));
+      if (x2 <= x1) return;
+      g.appendChild(el("rect", { x: x1, y: laneY, width: x2 - x1, height: TL.laneH, class: "maint-shade" }));
+    });
+
     g.appendChild(el("rect", { x: TL.left, y: laneY, width: state.svgWidth - TL.left - TL.right, height: TL.laneH, class: "lane-frame", rx: 4 }));
     const label = el("text", { x: TL.left - 8, y: laneY + TL.laneH / 2 + 4, "text-anchor": "end", class: "lane-label" });
     label.textContent = `${ch.device}/${ch.metric}`;
@@ -392,6 +527,18 @@ function renderTimeline() {
           fill: "#0f172a",
         }));
       }
+    });
+
+    // suppressed segments: rule truth on this channel that maintenance cut out
+    suppressed.filter((s) => s.device === ch.device && s.metric === ch.metric).forEach((s) => {
+      const x1 = xScale(Math.max(s.start, state.viewStart));
+      const x2 = xScale(Math.min(s.end, state.viewEnd));
+      if (x2 <= x1) return;
+      const rect = el("rect", { x: x1, y: laneY + 4, width: x2 - x1, height: 8, rx: 2, class: "supp-rect" });
+      attachTip(rect, () =>
+        `被维护抑制：${s.rule_name}\n${s.device}/${s.metric}\n${fmtTime(s.start)} → ${fmtTime(s.end)}（${fmtDur(s.end - s.start)}）\n` +
+        `关联维护窗口：${(s.maintenance_windows || []).map((w) => w.name || `#${w.id}`).join("、") || "—"}`);
+      g.appendChild(rect);
     });
 
     // evidence dots for selected fault
@@ -547,6 +694,9 @@ function openBrushPop(t0, t1, _xClient, xSvg) {
   $("brush-time").textContent = `${fmtTime(t0)} → ${fmtTime(t1)}（${fmtDur(t1 - t0)}）`;
   $("brush-label").value = "";
   $("brush-note").value = "";
+  $("brush-device").value = "";
+  document.querySelector('input[name="brush-kind"][value="annotation"]').checked = true;
+  syncBrushKind();
   const wrapRect = $("timeline-wrap").getBoundingClientRect();
   const svgRect = $("timeline").getBoundingClientRect();
   let left = (svgRect.left - wrapRect.left) + Math.min(Math.max(xSvg, TL.left), state.svgWidth - 260);
@@ -557,10 +707,42 @@ function openBrushPop(t0, t1, _xClient, xSvg) {
   $("brush-label").focus();
 }
 
-async function saveBrushAnnotation() {
+function brushKind() {
+  const r = document.querySelector('input[name="brush-kind"]:checked');
+  return r ? r.value : "annotation";
+}
+
+function syncBrushKind() {
+  const isMaint = brushKind() === "maintenance";
+  $("brush-device").hidden = !isMaint;
+  $("brush-label").placeholder = isMaint ? "维护名称，如：季度检修" : "标注名称，如：计划检修";
+  $("brush-save").textContent = isMaint ? "创建维护窗口" : "创建标注";
+}
+
+async function saveBrush() {
   if (!state.brush) return;
   const label = $("brush-label").value.trim();
-  if (!label) { toast("请填写标注名称", true); return; }
+  if (!label) { toast("请填写名称", true); return; }
+  if (brushKind() === "maintenance") {
+    const device = $("brush-device").value.trim();
+    if (!device) { toast("维护窗口需要填写设备", true); return; }
+    try {
+      // 服务端在写入后自动重新评估全部规则
+      await api("/api/maintenance", {
+        method: "POST",
+        body: JSON.stringify({
+          device, name: label,
+          start: state.brush.start, end: state.brush.end,
+          note: $("brush-note").value.trim() || null,
+        }),
+      });
+      $("brush-pop").hidden = true;
+      state.brush = null;
+      await reloadAll();
+      toast("维护窗口已创建，规则已重新评估");
+    } catch (e) { toast(e.message, true); }
+    return;
+  }
   try {
     await api("/api/annotations", {
       method: "POST",
@@ -778,6 +960,8 @@ function renderLegend() {
     `<span class="legend-item"><span class="swatch" style="background:${ruleColor(r.id)}"></span>${esc(r.name)}</span>`
   ).join("") +
     `<span class="legend-item"><span class="swatch" style="background:${ANN_COLOR};opacity:0.5"></span>区间标注</span>
+     <span class="legend-item"><span class="swatch" style="background:${MAINT_COLOR};opacity:0.55"></span>计划维护窗口（顶部维护带 + 设备泳道底色）</span>
+     <span class="legend-item"><span class="swatch" style="background:${SUPP_COLOR};opacity:0.65"></span>被维护抑制的片段</span>
      <span class="legend-item"><span style="color:#0f172a">▴</span> 故障确认时刻（start + 持续时长）</span>
      <span class="legend-item"><span style="color:#f97316">●</span> 选中故障的证据样本</span>`;
 }
@@ -856,6 +1040,7 @@ async function reloadAll() {
   renderFaults();
   renderFaultEvents();
   renderAnnotations();
+  renderMaintenance();
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
@@ -898,7 +1083,7 @@ async function applyFilter() {
   await loadFaultEvents();
   state.selectedFaultId = null;
   state.expandedEventId = null;
-  renderTimeline(); renderFaults(); renderFaultEvents(); renderAnnotations();
+  renderTimeline(); renderFaults(); renderFaultEvents(); renderAnnotations(); renderMaintenance();
   state.eventOffset = 0;
   await loadEvents(false);
   syncFilterInputs();
@@ -911,7 +1096,7 @@ async function clearFilter() {
   await loadFaultEvents();
   state.selectedFaultId = null;
   state.expandedEventId = null;
-  renderTimeline(); renderFaults(); renderFaultEvents(); renderAnnotations();
+  renderTimeline(); renderFaults(); renderFaultEvents(); renderAnnotations(); renderMaintenance();
   state.eventOffset = 0;
   await loadEvents(false);
   syncFilterInputs();
@@ -965,7 +1150,7 @@ function doExport() {
 }
 
 async function doReset() {
-  if (!confirm("将删除全部事件、规则、故障区间与标注，确定吗？")) return;
+  if (!confirm("将删除全部事件、规则、故障区间、维护窗口与标注，确定吗？")) return;
   await api("/api/reset", { method: "POST" });
   state.viewStart = state.viewEnd = state.dataStart = state.dataEnd = null;
   await reloadAll();
@@ -1002,6 +1187,10 @@ function bind() {
     bindCondRows();
   });
 
+  $("btn-new-maint").addEventListener("click", () => openMaintEditor(null));
+  $("btn-save-maint").addEventListener("click", saveMaintenance);
+  $("btn-cancel-maint").addEventListener("click", closeMaintEditor);
+
   $("btn-apply-filter").addEventListener("click", applyFilter);
   $("btn-clear-filter").addEventListener("click", clearFilter);
   $("btn-fit").addEventListener("click", clearFilter);
@@ -1010,8 +1199,10 @@ function bind() {
   $("tab-faults").addEventListener("click", () => switchFaultView("faults"));
   $("tab-events").addEventListener("click", () => switchFaultView("events"));
 
-  $("brush-save").addEventListener("click", saveBrushAnnotation);
+  $("brush-save").addEventListener("click", saveBrush);
   $("brush-cancel").addEventListener("click", () => { $("brush-pop").hidden = true; state.brush = null; });
+  document.querySelectorAll('input[name="brush-kind"]').forEach((r) =>
+    r.addEventListener("change", syncBrushKind));
 
   window.addEventListener("resize", () => { if (state.timeline) renderTimeline(); });
 }

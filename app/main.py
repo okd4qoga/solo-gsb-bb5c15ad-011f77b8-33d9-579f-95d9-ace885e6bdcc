@@ -88,6 +88,37 @@ class AnnotationIn(BaseModel):
         return start, end
 
 
+class MaintenanceIn(BaseModel):
+    device: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    start: Any
+    end: Any
+    note: str | None = None
+
+    def normalized(self) -> dict:
+        device = self.device.strip()
+        name = self.name.strip()
+        if not device or not name:
+            raise HTTPException(status_code=400, detail="maintenance device and name are required")
+        try:
+            start = to_epoch(self.start)
+            end = to_epoch(self.end)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if end <= start:
+            raise HTTPException(
+                status_code=400,
+                detail="maintenance window end must be greater than start (half-open [start, end))",
+            )
+        return {
+            "device": device,
+            "name": name,
+            "start": start,
+            "end": end,
+            "note": self.note,
+        }
+
+
 class ImportBody(BaseModel):
     text: str = ""
     filename: str | None = None
@@ -240,6 +271,7 @@ def _insert_rule(data: dict, rule_id: int | None = None) -> int:
             )
             conn.execute("DELETE FROM rule_conditions WHERE rule_id = ?", (rule_id,))
             conn.execute("DELETE FROM fault_intervals WHERE rule_id = ?", (rule_id,))
+            conn.execute("DELETE FROM suppressed_segments WHERE rule_id = ?", (rule_id,))
         for ord_, cond in enumerate(data["conditions"]):
             conn.execute(
                 "INSERT INTO rule_conditions (rule_id, device, metric, op, threshold, ord) VALUES (?,?,?,?,?,?)",
@@ -338,6 +370,88 @@ def delete_annotation(ann_id: int) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Planned maintenance windows
+# --------------------------------------------------------------------------- #
+
+
+def _maintenance_response(window_id: int) -> dict:
+    """Window payload plus the re-evaluation summary it triggered."""
+    window = db.fetch_maintenance_window(window_id)
+    evaluation = services.evaluate_all_rules()
+    return {
+        **window,
+        "evaluation": {
+            "rules_evaluated": evaluation["rules_evaluated"],
+            "fault_intervals": evaluation["fault_intervals"],
+            "suppressed_segments": evaluation["suppressed_segments"],
+        },
+    }
+
+
+@app.get("/api/maintenance")
+def get_maintenance(
+    start: str | None = None,
+    end: str | None = None,
+    device: str | None = None,
+) -> list[dict]:
+    return db.fetch_maintenance_windows(parse_bound(start), parse_bound(end), device)
+
+
+@app.post("/api/maintenance", status_code=201)
+def create_maintenance(mw: MaintenanceIn) -> dict:
+    data = mw.normalized()
+    cur = db.execute(
+        "INSERT INTO maintenance_windows (device, name, start_ts, end_ts, note, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (data["device"], data["name"], data["start"], data["end"], data["note"], time.time()),
+    )
+    return _maintenance_response(cur.lastrowid)
+
+
+@app.get("/api/maintenance/{window_id}")
+def get_maintenance_window(window_id: int) -> dict:
+    window = db.fetch_maintenance_window(window_id)
+    if window is None:
+        raise HTTPException(status_code=404, detail="maintenance window not found")
+    return window
+
+
+@app.put("/api/maintenance/{window_id}")
+def update_maintenance(window_id: int, mw: MaintenanceIn) -> dict:
+    if db.fetch_maintenance_window(window_id) is None:
+        raise HTTPException(status_code=404, detail="maintenance window not found")
+    data = mw.normalized()
+    db.execute(
+        "UPDATE maintenance_windows SET device = ?, name = ?, start_ts = ?, end_ts = ?, note = ?"
+        " WHERE id = ?",
+        (data["device"], data["name"], data["start"], data["end"], data["note"], window_id),
+    )
+    return _maintenance_response(window_id)
+
+
+@app.delete("/api/maintenance/{window_id}")
+def delete_maintenance(window_id: int) -> dict:
+    if db.fetch_maintenance_window(window_id) is None:
+        raise HTTPException(status_code=404, detail="maintenance window not found")
+    db.execute("DELETE FROM maintenance_windows WHERE id = ?", (window_id,))
+    evaluation = services.evaluate_all_rules()
+    return {
+        "deleted": window_id,
+        "evaluation": {
+            "rules_evaluated": evaluation["rules_evaluated"],
+            "fault_intervals": evaluation["fault_intervals"],
+            "suppressed_segments": evaluation["suppressed_segments"],
+        },
+    }
+
+
+@app.get("/api/suppressed")
+def get_suppressed(start: str | None = None, end: str | None = None) -> list[dict]:
+    """Segments where rule truth was suppressed by planned maintenance."""
+    return services.query_suppressed(parse_bound(start), parse_bound(end))
+
+
+# --------------------------------------------------------------------------- #
 # Timeline / export / reset
 # --------------------------------------------------------------------------- #
 
@@ -365,6 +479,8 @@ def export(
     )
     faults = [f for f in services.query_faults(start_ts, end_ts)]
     annotations = services.query_annotations(start_ts, end_ts)
+    maintenance = db.fetch_maintenance_windows(start_ts, end_ts)
+    suppressed = services.query_suppressed(start_ts, end_ts)
 
     # Split fault evidence into explicit per-condition evidence references so
     # the export carries raw events, fault intervals and their trigger proof.
@@ -389,7 +505,7 @@ def export(
         "time_range": {
             "start": start_ts,
             "end": end_ts,
-            "note": "events filtered inclusively; fault intervals/annotations overlap the half-open [start,end) window",
+            "note": "events filtered inclusively; fault intervals/annotations/maintenance windows overlap the half-open [start,end) window",
         },
         "rules": db.fetch_rules(),
         "events": events,
@@ -398,6 +514,8 @@ def export(
         "evidence_only_events": referenced_events,
         "fault_intervals": faults,
         "fault_events": services.query_fault_events(start_ts, end_ts),
+        "maintenance_windows": maintenance,
+        "suppressed_segments": suppressed,
         "annotations": annotations,
     }
 

@@ -124,9 +124,9 @@ body {
 .icon-btn { border: none; background: none; cursor: pointer; color: var(--muted); font-size: 13px; padding: 0 2px; }
 .icon-btn:hover { color: var(--danger); }
 
-#rule-editor { border-top: 1px dashed var(--border); margin-top: 10px; padding-top: 8px; }
+#rule-editor, #maint-editor { border-top: 1px dashed var(--border); margin-top: 10px; padding-top: 8px; }
 .field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
-.field input, .field select, .cond-row input, .cond-row select, #brush-label, #brush-note {
+.field input, .field select, .cond-row input, .cond-row select, #brush-label, #brush-note, #brush-device {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 5px 7px;
@@ -159,6 +159,30 @@ body {
 .anno-rect { fill: var(--anno); opacity: 0.28; }
 .anno-edge { stroke: #b45309; stroke-width: 1.4; }
 .anno-label-text { font-size: 10px; fill: #92400e; }
+
+/* planned maintenance */
+.maint-rect { fill: url(#maintHatch); stroke: #0d9488; stroke-opacity: 0.55; stroke-width: 0.8; }
+.maint-edge { stroke: #0f766e; stroke-width: 1.4; }
+.maint-label-text { font-size: 10px; fill: #0f766e; }
+.maint-shade { fill: #0d9488; opacity: 0.10; }
+.supp-rect { fill: url(#suppHatch); stroke: #b45309; stroke-width: 0.8; cursor: pointer; }
+
+.maint-hint { margin-bottom: 8px; line-height: 1.5; }
+.maint-list { display: flex; flex-direction: column; gap: 6px; }
+.maint-item {
+  border: 1px solid var(--border);
+  border-left: 3px solid #0d9488;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  background: #fbfcfe;
+}
+.maint-item:hover { border-color: #5eead4; }
+.maint-item .rname { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.maint-item .rmeta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+.brush-kind { display: flex; gap: 12px; font-size: 12px; color: var(--muted); }
+.brush-kind label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
 .crosshair { stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
 .crosshair-label { font-size: 10px; fill: #334155; }
 .brush-rect { fill: rgba(37, 99, 235, 0.15); stroke: var(--primary); stroke-dasharray: 4 3; }

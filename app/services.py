@@ -11,6 +11,7 @@ from .engine import (
     Condition,
     Event,
     Interval,
+    MaintenanceWindow,
     cluster_intervals,
     evaluate_rule,
     to_epoch,
@@ -156,29 +157,52 @@ def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | No
     return events_by_channel, horizon
 
 
+def _load_maintenance_windows() -> list[MaintenanceWindow]:
+    """All stored planned-maintenance windows as engine inputs."""
+    return [
+        MaintenanceWindow(
+            id=w["id"],
+            device=w["device"],
+            start=w["start"],
+            end=w["end"],
+            name=w["name"],
+        )
+        for w in db.fetch_maintenance_windows()
+    ]
+
+
 def evaluate_all_rules() -> dict:
-    """Re-evaluate every rule and replace its stored fault intervals."""
+    """Re-evaluate every rule and replace its stored fault intervals.
+
+    Planned-maintenance windows are merged per device and subtracted from the
+    truth segments before the duration check, so a maintenance interruption
+    resets the sustained duration and re-arms confirmation after the window.
+    The suppressed pieces are stored alongside for the timeline/export.
+    """
     rules = db.fetch_rules()
     events_by_channel, horizon = _load_events_index()
     if horizon is None:
         horizon = 0.0
+    maintenance = _load_maintenance_windows()
 
-    conn = db.get_conn()
     total = 0
+    total_suppressed = 0
     per_rule: list[dict] = []
     with db.transaction() as tx:
         for rule in rules:
             conditions = [Condition.from_dict(c) for c in rule["conditions"]]
-            faults = evaluate_rule(
+            result = evaluate_rule(
                 rule_id=rule["id"],
                 logic=rule["logic"],
                 duration_required=rule["duration"],
                 conditions=conditions,
                 events_by_channel=events_by_channel,
                 horizon=horizon,
+                maintenance=maintenance,
             )
             tx.execute("DELETE FROM fault_intervals WHERE rule_id = ?", (rule["id"],))
-            for f in faults:
+            tx.execute("DELETE FROM suppressed_segments WHERE rule_id = ?", (rule["id"],))
+            for f in result.faults:
                 tx.execute(
                     """
                     INSERT INTO fault_intervals
@@ -194,10 +218,40 @@ def evaluate_all_rules() -> dict:
                         json.dumps([e.to_dict() for e in f.evidence], ensure_ascii=False),
                     ),
                 )
-            total += len(faults)
-            per_rule.append({"rule_id": rule["id"], "rule_name": rule["name"], "faults": len(faults)})
+            for s in result.suppressed:
+                tx.execute(
+                    """
+                    INSERT INTO suppressed_segments
+                        (rule_id, device, metric, start_ts, end_ts, maintenance_ids)
+                    VALUES (?,?,?,?,?,?)
+                    """,
+                    (
+                        rule["id"],
+                        s.device,
+                        s.metric,
+                        s.interval.start,
+                        s.interval.end,
+                        json.dumps(s.maintenance_ids),
+                    ),
+                )
+            total += len(result.faults)
+            total_suppressed += len(result.suppressed)
+            per_rule.append(
+                {
+                    "rule_id": rule["id"],
+                    "rule_name": rule["name"],
+                    "faults": len(result.faults),
+                    "suppressed": len(result.suppressed),
+                }
+            )
 
-    return {"rules_evaluated": len(rules), "fault_intervals": total, "per_rule": per_rule}
+    return {
+        "rules_evaluated": len(rules),
+        "fault_intervals": total,
+        "suppressed_segments": total_suppressed,
+        "maintenance_windows": len(maintenance),
+        "per_rule": per_rule,
+    }
 
 
 def list_channels() -> list[dict]:
@@ -367,6 +421,58 @@ def query_fault_events(
     return build_fault_events(query_faults(None, None), start, end)
 
 
+def query_suppressed(
+    start: float | None = None, end: float | None = None
+) -> list[dict]:
+    """Suppressed segments (truth lost to maintenance), half-open filtered.
+
+    Each segment is linked to its rule and to the maintenance windows that
+    suppressed it (ids resolved to names for display/export).
+    """
+    where = []
+    params: list = []
+    if start is not None:
+        where.append("s.end_ts > ?")
+        params.append(start)
+    if end is not None:
+        where.append("s.start_ts < ?")
+        params.append(end)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    rows = db.query(
+        f"""
+        SELECT s.*, r.name AS rule_name
+        FROM suppressed_segments s JOIN rules r ON r.id = s.rule_id
+        {clause} ORDER BY s.start_ts, s.rule_id, s.id
+        """,
+        params,
+    )
+    windows = {w["id"]: w for w in db.fetch_maintenance_windows()}
+    out = []
+    for row in rows:
+        linked = []
+        for wid in json.loads(row["maintenance_ids"]):
+            w = windows.get(wid)
+            linked.append(
+                {"id": wid, "name": w["name"], "device": w["device"]}
+                if w
+                else {"id": wid, "name": None, "device": row["device"]}
+            )
+        out.append(
+            {
+                "id": row["id"],
+                "rule_id": row["rule_id"],
+                "rule_name": row["rule_name"],
+                "device": row["device"],
+                "metric": row["metric"],
+                "start": row["start_ts"],
+                "end": row["end_ts"],
+                "maintenance_ids": json.loads(row["maintenance_ids"]),
+                "maintenance_windows": linked,
+            }
+        )
+    return out
+
+
 def query_annotations(start: float | None = None, end: float | None = None) -> list[dict]:
     where = []
     params: list = []
@@ -457,6 +563,8 @@ def timeline_data(start: float | None, end: float | None, max_points: int = 400)
         "channels": channel_payload,
         "faults": query_faults(start, end),
         "annotations": query_annotations(start, end),
+        "maintenance": db.fetch_maintenance_windows(start, end),
+        "suppressed": query_suppressed(start, end),
         "data_start": bounds["lo"],
         "data_end": bounds["hi"],
     }
